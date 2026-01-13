@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+results.json
+processed_users.json
+find_05_followers.py
