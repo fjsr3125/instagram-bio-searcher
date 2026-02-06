@@ -14,6 +14,11 @@ st.set_page_config(
 FOLLOWERS_ACTOR = "datadoping~instagram-followers-scraper"
 PROFILE_ACTOR = "apify~instagram-profile-scraper"
 
+# 定数
+POLL_INTERVAL_SEC = 3
+COST_PER_FOLLOWER = 0.001
+COST_PER_PROFILE = 0.01
+
 
 def run_actor(api_token: str, actor_id: str, payload: dict, timeout: int = 600, status_placeholder=None) -> list:
     """Actorを実行して結果を返す"""
@@ -21,39 +26,62 @@ def run_actor(api_token: str, actor_id: str, payload: dict, timeout: int = 600, 
     params = {"token": api_token}
     headers = {"Content-Type": "application/json"}
 
-    response = requests.post(url, headers=headers, params=params, json=payload)
+    try:
+        response = requests.post(url, headers=headers, params=params, json=payload, timeout=30)
+    except requests.RequestException as e:
+        st.error(f"API接続エラー: {e}")
+        return []
 
     if response.status_code != 201:
         st.error(f"Error: {response.status_code} - {response.text[:200]}")
         return []
 
-    run_id = response.json()["data"]["id"]
+    try:
+        run_id = response.json()["data"]["id"]
+    except (KeyError, ValueError) as e:
+        st.error(f"APIレスポンスの解析に失敗: {e}")
+        return []
 
     # 完了待機
     status_url = f"https://api.apify.com/v2/actor-runs/{run_id}"
     start_time = time.time()
 
     while time.time() - start_time < timeout:
-        resp = requests.get(status_url, params=params)
+        try:
+            resp = requests.get(status_url, params=params, timeout=15)
+        except requests.RequestException:
+            time.sleep(POLL_INTERVAL_SEC)
+            continue
+
         if resp.status_code == 200:
-            status = resp.json()["data"]["status"]
+            try:
+                status = resp.json()["data"]["status"]
+            except (KeyError, ValueError):
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
             if status_placeholder:
-                status_placeholder.text(f"Status: {status}")
+                elapsed = int(time.time() - start_time)
+                status_placeholder.text(f"Status: {status} ({elapsed}s経過)")
 
             if status == "SUCCEEDED":
                 break
             elif status in ["FAILED", "ABORTED", "TIMED-OUT"]:
                 st.error(f"Failed: {status}")
                 return []
-        time.sleep(3)
+        time.sleep(POLL_INTERVAL_SEC)
     else:
         st.error("Timeout")
         return []
 
     # 結果取得
     results_url = f"https://api.apify.com/v2/actor-runs/{run_id}/dataset/items"
-    resp = requests.get(results_url, params=params)
-    return resp.json() if resp.status_code == 200 else []
+    try:
+        resp = requests.get(results_url, params=params, timeout=30)
+        return resp.json() if resp.status_code == 200 else []
+    except requests.RequestException as e:
+        st.error(f"結果取得エラー: {e}")
+        return []
 
 
 def init_session_state():
@@ -101,6 +129,8 @@ def main():
             help="bioに含まれるキーワード"
         )
 
+        case_insensitive = st.checkbox("大文字小文字を区別しない", value=True)
+
         st.markdown("---")
 
         max_followers = st.slider(
@@ -123,8 +153,8 @@ def main():
 
         st.markdown("---")
         st.markdown("### 💰 コスト目安（1回あたり）")
-        st.markdown(f"- フォロワー取得: ~${max_followers * 0.001:.2f}")
-        st.markdown(f"- プロフィール取得: ~${max_profiles * 0.01:.2f}")
+        st.markdown(f"- フォロワー取得: ~${max_followers * COST_PER_FOLLOWER:.2f}")
+        st.markdown(f"- プロフィール取得: ~${max_profiles * COST_PER_PROFILE:.2f}")
 
         st.markdown("---")
         st.markdown("### 📊 現在の状態")
@@ -175,7 +205,6 @@ def main():
 
         if not st.session_state.all_followers:
             status1 = st.empty()
-            progress1 = st.progress(0)
 
             followers_payload = {
                 "usernames": [target_username],
@@ -183,10 +212,9 @@ def main():
             }
 
             status1.text("Starting follower collection...")
-            progress1.progress(10)
 
             followers = run_actor(api_token, FOLLOWERS_ACTOR, followers_payload, timeout=300, status_placeholder=status1)
-            progress1.progress(100)
+            status1.empty()
 
             if not followers:
                 st.error("❌ フォロワーが取得できませんでした")
@@ -211,7 +239,7 @@ def main():
         col3.metric("Private", private_count)
 
         # 未処理ユーザーを特定
-        all_usernames = [f.get("username") for f in followers]
+        all_usernames = [f.get("username") for f in followers if f.get("username")]
         new_usernames = [u for u in all_usernames if u not in st.session_state.processed_users]
 
         st.info(f"📊 未処理: {len(new_usernames)} / {len(all_usernames)} 人")
@@ -223,7 +251,6 @@ def main():
         # Stage 2: 未処理ユーザーのプロフィール取得
         st.markdown("### 🔹 Stage 2: プロフィール詳細取得")
         status2 = st.empty()
-        progress2 = st.progress(0)
 
         # 未処理から上限分を取得
         usernames_to_check = new_usernames[:max_profiles]
@@ -233,10 +260,9 @@ def main():
         }
 
         status2.text(f"Getting {len(usernames_to_check)} new profiles...")
-        progress2.progress(10)
 
         profiles = run_actor(api_token, PROFILE_ACTOR, profile_payload, timeout=600, status_placeholder=status2)
-        progress2.progress(100)
+        status2.empty()
 
         if not profiles:
             st.error("❌ プロフィールが取得できませんでした")
@@ -259,7 +285,10 @@ def main():
             username = p.get("username", "")
             is_private = st.session_state.privacy_map.get(username, True)
 
-            if search_term in bio and username not in existing_usernames:
+            bio_check = bio.lower() if case_insensitive else bio
+            term_check = search_term.lower() if case_insensitive else search_term
+
+            if term_check in bio_check and username not in existing_usernames:
                 new_matches.append({
                     "username": username,
                     "full_name": p.get("fullName", ""),
@@ -320,11 +349,17 @@ def main():
             )
 
         with col2:
-            # CSV形式
+            # CSV形式（CSV injection対策付き）
+            def escape_csv_field(value: str) -> str:
+                value = value.replace('"', '""').replace('\n', ' ')
+                if value and value[0] in ('=', '+', '-', '@', '\t', '\r'):
+                    value = "'" + value
+                return f'"{value}"'
+
             csv_lines = ["username,full_name,bio,url,status"]
             for r in results:
-                bio_escaped = r["bio"].replace('"', '""').replace('\n', ' ')
-                csv_lines.append(f'"{r["username"]}","{r["full_name"]}","{bio_escaped}","{r["url"]}","{r["status"]}"')
+                fields = [r["username"], r["full_name"], r["bio"], r["url"], r["status"]]
+                csv_lines.append(",".join(escape_csv_field(f) for f in fields))
             csv_str = "\n".join(csv_lines)
 
             st.download_button(
